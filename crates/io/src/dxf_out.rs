@@ -12,7 +12,7 @@
 //! codes follow Autodesk's public DXF reference.
 
 use solidcraft_geom::prelude::*;
-use std::f64::consts::TAU;
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::fmt::Write as _;
 
 use solidcore_record::{Loop2, MAX_BEZIER_DEGREE, Seg2, Vec2};
@@ -290,10 +290,33 @@ impl DxfShape {
                             && let Some((p1, _)) = verts.get(next)
                         {
                             let chord = *p1 - *p0;
-                            let mid = (*p0 + *p1) * 0.5;
-                            let arc_mid = mid + chord.perp() * (*b * 0.5);
-                            if arc_mid.x.is_finite() && arc_mid.y.is_finite() {
-                                out.push(arc_mid);
+                            if chord.len() > 1e-12 {
+                                let mid = (*p0 + *p1) * 0.5;
+                                let arc_mid = mid - chord.perp() * (*b * 0.5);
+                                if arc_mid.x.is_finite() && arc_mid.y.is_finite() {
+                                    out.push(arc_mid);
+                                }
+                                let c = mid + chord.perp() * ((1.0 - b * b) / (4.0 * b));
+                                let r = (*p0 - c).len();
+                                if c.x.is_finite() && c.y.is_finite() && r.is_finite() {
+                                    let theta0 = (*p0 - c).angle();
+                                    let sweep = 4.0 * b.atan();
+                                    let angles = [0.0, FRAC_PI_2, PI, 3.0 * FRAC_PI_2];
+                                    let extrema =
+                                        [Vec2::new(c.x + r, c.y), Vec2::new(c.x, c.y + r), Vec2::new(c.x - r, c.y), Vec2::new(c.x, c.y - r)];
+                                    for (phi, pt) in angles.into_iter().zip(extrema) {
+                                        let on_arc = if sweep > 0.0 {
+                                            let d = (phi - theta0).rem_euclid(TAU);
+                                            d <= sweep + 1e-9 || d >= TAU - 1e-9
+                                        } else {
+                                            let d = (theta0 - phi).rem_euclid(TAU);
+                                            d <= -sweep + 1e-9 || d >= TAU - 1e-9
+                                        };
+                                        if on_arc && pt.x.is_finite() && pt.y.is_finite() {
+                                            out.push(pt);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1281,5 +1304,49 @@ mod tests {
         assert_eq!(pts.len(), 2);
         assert_eq!(pts[0], Vec2::new(0.0, 0.0));
         assert_eq!(pts[1], Vec2::new(10.0, 0.0));
+    }
+
+    #[test]
+    fn lwpolyline_bulged_arc_extents_and_extrema() {
+        // Closed polyline: a flat base from (-10, 0) to (10, 0) and a CCW semicircle arc
+        // from (10, 0) to (-10, 0) bulging upwards into y > 0 (bulge = tan(pi / 4) = 1.0).
+        let shape = DxfShape::LwPolyline { verts: vec![(Vec2::new(-10.0, 0.0), 0.0), (Vec2::new(10.0, 0.0), 1.0)], closed: true };
+        let dxf = write_dxf_drawing(&[], &[DxfEntity { layer: "0".into(), shape }]).unwrap();
+        let p = pairs(&dxf);
+        let after = |var: &str| &p[p.iter().position(|(c, v)| (*c, v.as_str()) == (9, var)).unwrap() + 1..];
+        let min_x: f64 = after("$EXTMIN")[0].1.parse().unwrap();
+        let min_y: f64 = after("$EXTMIN")[1].1.parse().unwrap();
+        let max_x: f64 = after("$EXTMAX")[0].1.parse().unwrap();
+        let max_y: f64 = after("$EXTMAX")[1].1.parse().unwrap();
+        assert!((min_x - (-10.0)).abs() < 1e-6);
+        assert!(min_y.abs() < 1e-6);
+        assert!((max_x - 10.0).abs() < 1e-6);
+        assert!((max_y - 10.0).abs() < 1e-6);
+
+        // Negative bulge (CW semicircle arc): bulging downwards into y < 0 (bulge = -1.0)
+        let shape_cw = DxfShape::LwPolyline { verts: vec![(Vec2::new(-10.0, 0.0), 0.0), (Vec2::new(10.0, 0.0), -1.0)], closed: true };
+        let dxf_cw = write_dxf_drawing(&[], &[DxfEntity { layer: "0".into(), shape: shape_cw }]).unwrap();
+        let p_cw = pairs(&dxf_cw);
+        let after_cw = |var: &str| &p_cw[p_cw.iter().position(|(c, v)| (*c, v.as_str()) == (9, var)).unwrap() + 1..];
+        let min_x_cw: f64 = after_cw("$EXTMIN")[0].1.parse().unwrap();
+        let min_y_cw: f64 = after_cw("$EXTMIN")[1].1.parse().unwrap();
+        let max_x_cw: f64 = after_cw("$EXTMAX")[0].1.parse().unwrap();
+        let max_y_cw: f64 = after_cw("$EXTMAX")[1].1.parse().unwrap();
+        assert!((min_x_cw - (-10.0)).abs() < 1e-6);
+        assert!((min_y_cw - (-10.0)).abs() < 1e-6);
+        assert!((max_x_cw - 10.0).abs() < 1e-6);
+        assert!(max_y_cw.abs() < 1e-6);
+
+        // Also verify that an arc whose chord midpoint does not reach the axis extremum
+        // correctly captures the extremum in the drawing's extents:
+        // Circle of radius 10 at origin, arc from (8, 6) to (-6, 8) with sweep 90° (bulge tan(pi/8)).
+        // Endpoints have y = 6 and y = 8; arc midpoint has y ≈ 9.899; axis extremum at (0, 10) has y = 10.0.
+        let bulge_90 = (std::f64::consts::FRAC_PI_2 / 4.0).tan();
+        let shape_asym = DxfShape::LwPolyline { verts: vec![(Vec2::new(-6.0, 8.0), 0.0), (Vec2::new(8.0, 6.0), bulge_90)], closed: true };
+        let dxf_asym = write_dxf_drawing(&[], &[DxfEntity { layer: "0".into(), shape: shape_asym }]).unwrap();
+        let p_asym = pairs(&dxf_asym);
+        let after_asym = |var: &str| &p_asym[p_asym.iter().position(|(c, v)| (*c, v.as_str()) == (9, var)).unwrap() + 1..];
+        let asym_max_y: f64 = after_asym("$EXTMAX")[1].1.parse().unwrap();
+        assert!((asym_max_y - 10.0).abs() < 1e-6, "expected maximum y = 10.0 from axis extremum, got {asym_max_y}");
     }
 }

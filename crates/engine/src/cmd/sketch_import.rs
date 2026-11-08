@@ -296,6 +296,24 @@ fn sorted_curve_ids<'a>(ids: &'a [String]) -> Vec<&'a str> {
     v
 }
 
+fn validate_dxf_layer_name<'a>(raw: &'a str, cmd: &str) -> Result<Option<&'a str>> {
+    if raw.chars().any(char::is_control) {
+        return Err(bad(cmd, "`layer` contains invalid control characters"));
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > 255 {
+        return Err(bad(cmd, "`layer` name exceeds 255 characters"));
+    }
+    const FORBIDDEN_LAYER_CHARS: &[char] = &['<', '>', '/', '\\', '"', ':', ';', '?', '*', '|', '=', '`'];
+    if let Some(c) = trimmed.chars().find(|c| FORBIDDEN_LAYER_CHARS.contains(c)) {
+        return Err(bad(cmd, format!("`layer` name contains invalid character {c:?}")));
+    }
+    Ok(Some(trimmed))
+}
+
 fn export_dxf(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.export_dxf";
     let id = sketch_store::target(s, p, cmd)?;
@@ -338,7 +356,10 @@ fn export_dxf(s: &mut Session, p: &Value) -> Result<Value> {
     {
         return Err(bad(cmd, "`layer` must be a string"));
     }
-    let custom_layer = str_(p, "layer").map(str::trim).filter(|s| !s.is_empty());
+    let custom_layer = match str_(p, "layer") {
+        Some(s) => validate_dxf_layer_name(s, cmd)?,
+        None => None,
+    };
 
     let layers_val = p.get("layers").filter(|v| !v.is_null());
     if let Some(v) = layers_val
@@ -756,10 +777,29 @@ mod tests {
         assert!(s.execute("sketch.export_dxf", &json!({"units": 123})).is_err());
         assert!(s.execute("sketch.export_dxf", &json!({"units": "unknown_unit"})).is_err());
         assert!(s.execute("sketch.export_dxf", &json!({"layer": 456})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "foo\nbar"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "\n"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "foo\r\nbar"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "\t"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "bad/layer"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "bad<layer"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "bad*layer"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "bad:layer"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "bad;layer"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "bad?layer"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "bad|layer"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "bad=layer"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "bad`layer"})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "a".repeat(256)})).is_err());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "a".repeat(255)})).is_ok());
         assert!(s.execute("sketch.export_dxf", &json!({"layers": 123})).is_err());
         assert!(s.execute("sketch.export_dxf", &json!({"layers": "all"})).is_err());
         assert!(s.execute("sketch.export_dxf", &json!({"join": "true"})).is_err());
         assert!(s.execute("sketch.export_dxf", &json!({"path": 123})).is_err());
+
+        // Empty or omitted layer stays accepted with default behavior
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": ""})).is_ok());
+        assert!(s.execute("sketch.export_dxf", &json!({"layer": "   "})).is_ok());
     }
 
     #[test]
